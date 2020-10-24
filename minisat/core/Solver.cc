@@ -1,21 +1,8 @@
 /***************************************************************************************[Solver.cc]
 Copyright (c) 2003-2006, Niklas Een, Niklas Sorensson
 Copyright (c) 2007-2010, Niklas Sorensson
+Copyright (c) 2013-2013, Norbert Manthey
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute,
-sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or
-substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
-NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
-DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
-OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 **************************************************************************************************/
 
 #include <math.h>
@@ -25,6 +12,10 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #include "minisat/utils/System.h"
 #include "minisat/core/Solver.h"
 
+#include "VarFileParser.h"  // to parse the white file
+
+# include <fstream>
+
 using namespace Minisat;
 
 //=================================================================================================
@@ -32,6 +23,7 @@ using namespace Minisat;
 
 
 static const char* _cat = "CORE";
+static const char* _cat2 = "COUNTING";
 
 static DoubleOption  opt_var_decay         (_cat, "var-decay",   "The variable activity decay factor",            0.95,     DoubleRange(0, false, 1, false));
 static DoubleOption  opt_clause_decay      (_cat, "cla-decay",   "The clause activity decay factor",              0.999,    DoubleRange(0, false, 1, false));
@@ -46,6 +38,13 @@ static DoubleOption  opt_restart_inc       (_cat, "rinc",        "Restart interv
 static DoubleOption  opt_garbage_frac      (_cat, "gc-frac",     "The fraction of wasted memory allowed before a garbage collection is triggered",  0.20, DoubleRange(0, false, HUGE_VAL, false));
 static IntOption     opt_min_learnts_lim   (_cat, "min-learnts", "Minimum learnt clause limit",  0, IntRange(0, INT32_MAX));
 
+static IntOption     opt_countModels       (_cat2, "countMode",    "How to count models (0=none,1=all,2=projected,3=projectedComplex,4=projectOrder,5=projectComplexFast)", 0, IntRange(0,5));
+// is delared extern, so that the simp file can read it as well
+StringOption  opt_projection        (_cat2, "projection",   "Which variables should be used for model projection");
+static BoolOption    opt_talk              (_cat2, "talk",         "Do output to screen", false);
+static IntOption     opt_timestamps        (_cat2, "timestamps",   "Print timestamp when a model has been found (0=no,1=cumulative,2=relative)", 0, IntRange(0,2));
+static StringOption  opt_pOutFile          (_cat2, "projectToDNF", "Where to store the projection to");
+static IntOption     opt_maxModels         (_cat2, "maxModel",     "Stop after X models", INT32_MAX, IntRange(0,INT32_MAX));
 
 //=================================================================================================
 // Constructor/Destructor:
@@ -101,6 +100,13 @@ Solver::Solver() :
   , conflict_budget    (-1)
   , propagation_budget (-1)
   , asynch_interrupt   (false)
+  
+  // counting
+  , modelCount(0)
+  , countTime(0)
+  , isInProjection(0)
+  , lastCheckPosition(0)
+  , fileMemory(0)
 {}
 
 
@@ -736,7 +742,7 @@ lbool Solver::search(int nof_conflicts)
                 learntsize_adjust_cnt    = (int)learntsize_adjust_confl;
                 max_learnts             *= learntsize_inc;
 
-                if (verbosity >= 1)
+                if(opt_talk) if (verbosity >= 1)
                     printf("| %9d | %7d %8d %8d | %8d %8d %6.0f | %6.3f %% |\n", 
                            (int)conflicts, 
                            (int)dec_vars - (trail_lim.size() == 0 ? trail.size() : trail_lim[0]), nClauses(), (int)clauses_literals, 
@@ -781,15 +787,24 @@ lbool Solver::search(int nof_conflicts)
                 next = pickBranchLit();
 
                 if (next == lit_Undef)
+		  if( opt_countModels == 0 )
                     // Model found:
                     return l_True;
+		  else {
+		    next = countModel(learnt_clause);
+		    if( modelCount >= (int)opt_maxModels ) break;
+		    if ( next == lit_Undef )
+		      goto SolverNextSearchIteration;
+		  }
             }
 
             // Increase decision level and enqueue 'next'
             newDecisionLevel();
             uncheckedEnqueue(next);
         }
+SolverNextSearchIteration:;
     }
+    return l_Undef;
 }
 
 
@@ -842,6 +857,8 @@ lbool Solver::solve_()
     conflict.clear();
     if (!ok) return l_False;
 
+    initCountModel();
+    
     solves++;
 
     max_learnts = nClauses() * learntsize_factor;
@@ -852,7 +869,7 @@ lbool Solver::solve_()
     learntsize_adjust_cnt     = (int)learntsize_adjust_confl;
     lbool   status            = l_Undef;
 
-    if (verbosity >= 1){
+    if(opt_talk) if (verbosity >= 1){
         printf("============================[ Search Statistics ]==============================\n");
         printf("| Conflicts |          ORIGINAL         |          LEARNT          | Progress |\n");
         printf("|           |    Vars  Clauses Literals |    Limit  Clauses Lit/Cl |          |\n");
@@ -864,11 +881,22 @@ lbool Solver::solve_()
     while (status == l_Undef){
         double rest_base = luby_restart ? luby(restart_inc, curr_restarts) : pow(restart_inc, curr_restarts);
         status = search(rest_base * restart_first);
+	if( modelCount >= (int)opt_maxModels ) break; // interrupt after reaching number of models
         if (!withinBudget()) break;
         curr_restarts++;
     }
 
-    if (verbosity >= 1)
+    if( opt_countModels != 0 ) {
+      fprintf(stderr, "Found Models: %lu", modelCount );
+      if( status == l_Undef ) fprintf(stderr, "  UNTIL being interrupted");
+      if( modelCount >= opt_maxModels ) fprintf(stderr, "  UNTIL reaching maximum");
+      fprintf(stderr,"\n");
+      printf( "%lu\n", modelCount );
+      writeStreanToFile();
+      exit(0);
+    }
+    
+    if(opt_talk) if (verbosity >= 1)
         printf("===============================================================================\n");
 
 
@@ -1059,8 +1087,252 @@ void Solver::garbageCollect()
     ClauseAllocator to(ca.size() - ca.wasted()); 
 
     relocAll(to);
-    if (verbosity >= 2)
+    if(opt_talk) if (verbosity >= 2)
         printf("|  Garbage collection:   %12d bytes => %12d bytes             |\n", 
                ca.size()*ClauseAllocator::Unit_Size, to.size()*ClauseAllocator::Unit_Size);
     to.moveTo(ca);
+}
+
+Lit Solver::countModel(vec< Lit >& learnt_clause)
+{
+  if( opt_pOutFile != "" ) {
+    if( fileMemory == 0 ) fileMemory = new stringstream; 
+  }
+
+  countTime = cpuTime() - countTime; // stop timer for last step
+  if( opt_timestamps > 0) fprintf( stderr, "| Found model %6d after %10lf seconds                                 |\n", modelCount + 1, countTime );
+  countTime = cpuTime() - ( opt_timestamps == 1 ? countTime : 0 ); // start timer for next step
+  
+  if( opt_countModels == 1 )  {
+	      modelCount ++; // one more model
+	      // negate all decision variables
+	      addDecisionClause(learnt_clause);
+	      return lit_Undef;
+	    } if( opt_countModels == 2) {
+	      modelCount ++; // one more model
+	      // count all models by adding the negated decision clause
+	      // negate all variables from the projection
+	      addProjectionClause(learnt_clause);
+	      return lit_Undef;
+	    } else if( opt_countModels == 3) {
+	      // check if formula is SAT without setting projection variables
+	      CRef notSatisfied = giveNotSatisfiedClause();
+	      // is formula satisfied?
+	      if( notSatisfied == CRef_Undef ) {
+		// satisfied -> count models
+		// consider only variables in the projection that are mapped to a value! (have multiple models with one SAT formula!)
+	        // count all models by adding the negated decision clause
+	        // negate all variables from the projection that are still in the trail
+	        addProjectionClause(learnt_clause);
+	        uint32_t cutModels = 1;
+	        for( int i = 1 ; i < projectionVariables.size(); ++ i ) {
+		  cutModels *= 2;
+	        }
+                for( int i = 1 ; i < learnt_clause.size(); ++ i ) {
+		  cutModels /= 2;
+	        }
+	        modelCount += cutModels; // sum models
+	        return lit_Undef;
+	      } else {
+	        // found not satisfied clause - pick literal to satisfy it!
+	        Lit decideLit = lit_Undef;
+		const Clause& c = ca[notSatisfied];
+		for( int i = 0 ; i < c.size(); ++ i ) {
+		 if( value( c[i]) == l_Undef ) { decideLit = c[i]; break; } 
+		}
+		assert( isInProjection[ var(decideLit) ] && "only projection variables are left to satisfy clauses!" );
+		// do usual decision and redo check afterwards!
+		return decideLit;
+	      }
+	    } else if( opt_countModels == 4) { // if sat, disallow model, but order of variables is different to 2!
+	      for( int i = 0 ; i < projectionVariables.size(); ++i ) { // is there still a literal to be satisfied?
+		if( value( projectionVariables[i] ) == l_Undef ) return mkLit( projectionVariables[i], polarity[projectionVariables[i]] );
+	      }
+	      modelCount ++; // one more model
+	      // count all models by adding the negated decision clause
+	      // negate all variables from the projection
+	      addProjectionClause(learnt_clause);
+	      return lit_Undef;
+	    } else if( opt_countModels == 5) {
+	      for( int i = 0 ; i < projectionVariables.size(); ++i ) { // is there still a literal to be satisfied?
+		if( value( projectionVariables[i] ) == l_Undef ) return mkLit( projectionVariables[i], polarity[projectionVariables[i]] );
+	      }
+	      int satLevel = 0; // find the highest level that is needed to satisfy the whole formula
+	      for( int i = 0 ; i < clauses.size(); ++ i ) {
+		const Clause& c = ca[clauses[i]];
+		int smallLevel = decisionLevel();
+		for( int j = 0 ; j < c.size(); ++ j ) {
+		 if( value( c[j] ) == l_True ) {
+		   int l = level( var(c[j]) );
+		   smallLevel = smallLevel < l ? smallLevel : l; // select smallest satisfying level per clause
+		 }
+		}
+		satLevel = smallLevel > satLevel ? smallLevel : satLevel; // level gets highest level of the whole formula!
+	      }
+	      // clear levels that are not necessary!
+	      cancelUntil( satLevel );
+	      // count all models by adding the negated decision clause
+	      // negate all variables from the projection
+	      addProjectionClause(learnt_clause);
+	      uint32_t cutModels = 1;
+	      for( int i = 1 ; i < projectionVariables.size(); ++ i ) {
+		cutModels *= 2;
+	      }
+              for( int i = 1 ; i < learnt_clause.size(); ++ i ) {
+		cutModels /= 2;
+	      }
+	      modelCount += cutModels; // sum models
+	      return lit_Undef;
+	    } else {
+	      assert (false && "Method not yet implemented!" ); 
+	    }
+	    return lit_Error;
+}
+
+void Solver::initCountModel()
+{
+    if( opt_countModels > 1 ) { // do model counting
+      if( isInProjection == 0 && opt_projection != 0) {
+	// read in projection variables
+        //projectionVariables
+        VarFileParser parse ( (string)opt_projection );  // open file for parsing
+        int max = parse.extract(projectionVariables);
+	max = max >= nVars() ? max : nVars();
+	isInProjection = (char*) malloc( sizeof(char) * max + 1 );
+	memset( isInProjection, 0, sizeof(char) * max + 1 );
+	for( int i = 0 ; i < projectionVariables.size(); ++i ) {
+	  projectionVariables [i] --;                    // minisat representation!
+	  isInProjection[ projectionVariables [i] ] = 1; // set to 1
+	  // if complex mode, do not decide on project-variables!
+	  if( opt_countModels >= 3 ) { 
+	    decision[ projectionVariables [i] ] = false;
+	  }
+	}
+      } else {
+	// take care of the size of the array
+	isInProjection = (char*)realloc( isInProjection, sizeof(char) * nVars() + 1 );
+      }
+    }
+}
+
+CRef Solver::giveNotSatisfiedClause()
+{
+	      CRef notSatisfied = CRef_Undef;
+	      lastCheckPosition = lastCheckPosition > clauses.size() ? clauses.size() : lastCheckPosition; // check bound
+	      for( int i = lastCheckPosition ; i < clauses.size(); ++ i ) { // search after last found position!
+		if ( satisfied(ca[clauses[i]] ) ) continue;
+		notSatisfied = clauses[i]; lastCheckPosition = i; // store clause and last position!
+		break;
+	      }
+	      if( notSatisfied == CRef_Undef ) { // also look in other partition!
+	        for( int i = 0; i < lastCheckPosition; ++ i ) { // search after last found position!
+		  if ( satisfied(ca[clauses[i]] ) ) continue;
+		  notSatisfied = clauses[i]; lastCheckPosition = i;  // store clause and last position!
+		  break;
+	        }
+	      }
+	      return notSatisfied;
+}
+
+void Solver::addDecisionClause(vec< Lit >& learnt_clause)
+{
+// 	      int maxLevel = 0;
+// 	      int max2Level = 0;
+// 	      for( int i = 0 ; i < trail_lim.size(); ++ i ) {
+// 		Lit l = ~ trail[ trail_lim[i] ];
+// 		int varLevel = level( var(l) );
+// 		if( varLevel > maxLevel ) { max2Level = maxLevel; maxLevel = varLevel; }
+// 		else if (varLevel > max2Level ) { max2Level = varLevel; }
+// 		learnt_clause.push( l );  
+// 	      }
+	      learnt_clause.clear();
+	      int maxLevel = 0;
+	      int max2Level = 0;
+	      for( int i = 0 ; i <trail_lim.size(); ++ i ) {
+		Lit l = ~ trail[ trail_lim[i] ];
+		int varLevel = level( var(l) );
+		if( varLevel > maxLevel ) { max2Level = maxLevel; maxLevel = varLevel; }
+		else if (varLevel > max2Level ) { max2Level = varLevel; }
+		learnt_clause.push( l );  
+	      }
+	      // modify clause so that the first two literals are l_Undef
+	      int tmp = 0 ;
+	      for( int i = 0 ; i< learnt_clause.size(); ++ i ) {
+		if( level(var(learnt_clause[i])) >= max2Level ) {
+		  Lit tmpL = learnt_clause[i];
+		  learnt_clause[i] = learnt_clause[tmp];
+		  learnt_clause[tmp] = tmpL;
+		  tmp ++;
+		}
+	      }
+	      // can clause be used for unit propagation on some level?
+	      if( max2Level > 1 && learnt_clause.size() > 2 ) {
+		// create clause
+               CRef cr = ca.alloc(learnt_clause, false);
+               clauses.push(cr);			
+		cancelUntil(max2Level - 1);
+		assert( value( learnt_clause[0] ) == l_Undef && value(learnt_clause[1]) == l_Undef && "first two literals have to be undefined" );
+		attachClause( cr );
+	      } else { // restart and add clause (should be unary/conflict on level 0)
+	        cancelUntil(0); // todo: can we get rid of the restart?
+	        addClause( learnt_clause );
+	      }
+	      writeModelToStream(learnt_clause);
+}
+
+
+void Solver::addProjectionClause(vec< Lit >& learnt_clause)
+{
+              learnt_clause.clear();
+	      int maxLevel = 0;
+	      int max2Level = 0;
+	      for( int i = 0 ; i < projectionVariables.size(); ++ i ) {
+		if( value(projectionVariables[i]) == l_Undef ) continue;
+		Lit l = mkLit( projectionVariables[i], value( projectionVariables[i] ) == l_True ? true : false );
+		int varLevel = level( var(l) );
+		if( varLevel > maxLevel ) { max2Level = maxLevel; maxLevel = varLevel; }
+		else if (varLevel > max2Level ) { max2Level = varLevel; }
+		learnt_clause.push( l );  
+	      }
+	      // modify clause so that the first two literals are l_Undef
+	      int tmp = 0 ;
+	      for( int i = 0 ; i< learnt_clause.size(); ++ i ) {
+		if( level(var(learnt_clause[i])) >= max2Level ) {
+		  Lit tmpL = learnt_clause[i];
+		  learnt_clause[i] = learnt_clause[tmp];
+		  learnt_clause[tmp] = tmpL;
+		  tmp ++;
+		}
+	      }
+	      // can clause be used for unit propagation on some level?
+	      if( max2Level > 1 && learnt_clause.size() > 2 ) {
+		// create clause
+               CRef cr = ca.alloc(learnt_clause, false);
+               clauses.push(cr);			
+		cancelUntil(max2Level - 1);
+		assert( value( learnt_clause[0] ) == l_Undef && value(learnt_clause[1]) == l_Undef && "first two literals have to be undefined" );
+		attachClause( cr );
+	      } else { // restart and add clause (should be unary/conflict on level 0)
+	        cancelUntil(0); // todo: can we get rid of the restart?
+	        addClause( learnt_clause );
+	      }
+	      writeModelToStream(learnt_clause);
+}
+
+void Solver::writeModelToStream(vec< Lit >& invClause)
+{
+  if( fileMemory == 0 ) return;
+  for( int i = 0 ; i < invClause.size(); ++ i ) {
+    const Lit l = ~invClause[i];
+    (*fileMemory ) << (sign(l) ? "-" : "") <<  var(l)+1 << " ";
+  }
+  (*fileMemory ) << "0" << endl;
+}
+
+void Solver::writeStreanToFile()
+{
+  if( opt_pOutFile == "" ) return;
+  std::ofstream file( opt_pOutFile );
+  file << fileMemory->str();
+  file.close();
 }

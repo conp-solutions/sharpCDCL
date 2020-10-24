@@ -1,21 +1,8 @@
 /****************************************************************************************[Solver.h]
 Copyright (c) 2003-2006, Niklas Een, Niklas Sorensson
 Copyright (c) 2007-2010, Niklas Sorensson
+Copyright (c) 2013-2013, Norbert Manthey
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute,
-sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or
-substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
-NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
-DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
-OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 **************************************************************************************************/
 
 #ifndef Minisat_Solver_h
@@ -28,6 +15,8 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #include "minisat/utils/Options.h"
 #include "minisat/core/SolverTypes.h"
 
+#include <vector>
+#include <sstream>
 
 namespace Minisat {
 
@@ -294,6 +283,23 @@ protected:
     // Returns a random integer 0 <= x < size. Seed must never be 0.
     static inline int irand(double& seed, int size) {
         return (int)(drand(seed) * size); }
+        
+        
+// model counting:
+    void initCountModel();                                                 // initialization of model counting
+    Lit countModel(vec<Lit>& learnt_clause);                               // implement model counting code, return a literal if another decision should be made
+    CRef giveNotSatisfiedClause();                                         // return a not satisfied clause from the clause set
+    void addDecisionClause( vec<Lit>& learnt_clause );                     // create a clause that disallows the current decisions, and add it to the formula
+    void addProjectionClause(Minisat::vec< Minisat::Lit >& learnt_clause); // add a clause to the solver that disallows the current projection to be part of the formula
+    void writeModelToStream( vec<Lit>& invClause );                        // write the current "disallow-clause" as model into the stream
+    void writeStreanToFile();
+    
+    uint64_t modelCount;                      // number of models that have been found so far
+    double countTime;                         // cpu timer to show time between found models
+    int lastCheckPosition;                    // for satisfy-check, store last position!
+    char* isInProjection;                     // per variable it is stored whether this variable is inside the projection
+    std::vector<int> projectionVariables;     // variables with the projection
+    std::stringstream* fileMemory;            // stream to buffer projection into
 };
 
 
